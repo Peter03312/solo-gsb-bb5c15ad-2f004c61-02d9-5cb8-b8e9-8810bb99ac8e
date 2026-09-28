@@ -29,6 +29,13 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 累加，仅保留缓存中**正价值**的字节，按"每字节累计权重降序、偏移升序"选满
 预算（允许在区间内部截断），返回归并后的保留区间与字节核算（见下文）。
 
+`POST /shared-fetch-plan` 面向多客户端**共享回源**：同一资源被多个客户端
+并行请求时，提交资源总字节数、各客户端标识与其所需闭区间、单次回源字节
+上限和允许跨越的最大空隙；服务先跨客户端归并重叠/相邻需求并按上限拆块，
+再自左向右合并候选（仅在间隙不超过阈值且合并后不超上限时跨隙），输出
+升序互不重叠的回源闭区间、可直接使用的 `Range` 值、每个客户端被各次回源
+覆盖的字节，以及去重需求 / 实际回源 / 额外获取的字节核算（见下文）。
+
 ## 单条启动命令
 
 ```bash
@@ -560,6 +567,103 @@ curl -X POST http://localhost:3000/cache-retention-plan \
 }
 ```
 
+### `POST /shared-fetch-plan`（共享回源规划）
+
+同一资源被多个客户端并行请求时，代理/客户端可把各自的需求合并成一份
+**共享回源计划**，避免多个客户端各拉各的、重复回源。全部参数在 JSON 体内，
+不涉及 `Range` 请求头：
+
+| 字段            | 类型    | 必填 | 说明                                                         |
+| --------------- | ------- | ---- | ------------------------------------------------------------ |
+| `size`          | integer | 是   | 资源总字节数，非负安全整数（≥ 0）                             |
+| `clients`       | array   | 是   | 客户端数组（≤ 1000 项），每项 `{"id":…,"ranges":…}`：`id` 为非空字符串（≤ 255 字节、不含 CR/LF），同一请求内不得重复；`ranges` 为该客户端所需闭区间数组（≤ 10000 项），每项 `{"start":…,"end":…}` 须满足 `0 ≤ start ≤ end < size`，可乱序、重叠、相邻 |
+| `maxFetchBytes` | integer | 是   | 单次回源字节上限，正安全整数（≥ 1）                           |
+| `maxGapBytes`   | integer | 是   | 允许跨越的最大空隙（字节），非负安全整数（≥ 0）               |
+
+规划算法严格按两步执行：
+
+1. **归并需求并拆块**：把所有客户端的区间合在一起，重叠或相邻（间隔为 0）
+   的需求先归并为跨客户端的去重需求；再自左向右按 `maxFetchBytes` 切成
+   候选块（每块长度 ≤ 上限）。
+2. **自左向右跨隙合并**：维护当前回源段，依次考察右侧候选块；只有当
+   **间隙 ≤ `maxGapBytes`** 且**合并后长度 ≤ `maxFetchBytes`** 时才把该块
+   并入当前段（间隙字节也一并拉取），否则另起一段。算法只向右看、不回溯
+   合并。
+
+校验与 `/resume-plan` 同样严格（严格校验器，不做类型强转）：所有数值必须
+是安全整数——字符串 `"1000"`、小数、负数、超过 `Number.MAX_SAFE_INTEGER`
+的值一律 `400`；区间倒置（`start > end`）或越界（`end ≥ size`）返回
+`400 INVALID_CLIENT_RANGE` / `400 CLIENT_RANGE_OUT_OF_BOUNDS`；重复或空
+标识返回 `400 DUPLICATE_CLIENT_ID` / `400 INVALID_CLIENT_ID`；
+`maxFetchBytes` / `maxGapBytes` 非法返回 `400 INVALID_MAX_FETCH_BYTES` /
+`400 INVALID_MAX_GAP_BYTES`；不允许多余字段。空资源（`size: 0`）或无客户端
+（`clients: []`）返回空计划（`fetches: []`、各字节核算为 0）。
+
+响应（`200`）字段：
+
+| 字段             | 说明                                                         |
+| ---------------- | ------------------------------------------------------------ |
+| `limits`         | 回显本次使用的 `maxFetchBytes` / `maxGapBytes`                |
+| `clientsCount`   | 参与规划的客户端数量                                          |
+| `fetchesCount`   | 规划出的回源次数                                              |
+| `fetches[]`      | 每次回源：`index`、`start`/`end`（**升序、互不重叠**的闭区间）、`bytes`、`rangeHeader`（可直接作为 `Range` 请求头值，如 `bytes=300-544`）、`demandBytes`（该次回源覆盖的去重需求字节）、`extraBytes`（为跨隙多拉的空隙字节，`bytes − demandBytes`） |
+| `clients[]`      | 按提交顺序排列的每个客户端：`id`、`requestedBytes`（其自身需求归并后的字节数）、`servedBytes`、`missingBytes`（正常规划恒为 0）、`coverage[]`——逐次回源列出覆盖该客户端的闭区间 `ranges`（一次回源可覆盖该客户端的多个分离区间）、对应 `fetchIndex` 与 `bytes` |
+| `bytes.demand`   | **去重需求字节数**：跨所有客户端归并后的需求字节总和          |
+| `bytes.fetched`  | **实际回源字节数**：所有回源区间长度之和                      |
+| `bytes.extra`    | **额外获取字节数**（`fetched − demand`，全部是跨隙填充的空隙字节） |
+| `bytes.resource` | 资源总字节数（即 `size`）                                     |
+
+示例：客户端 `a` 需要 `[0,449]`（按 300 上限拆成 `[0,299]` 与
+`[300,449]`），客户端 `b` 需要 `[455,544]`；尾块与 b 之间只有 5 字节
+空隙（450–454），不超过 `maxGapBytes: 10`，且 `150 + 5 + 90 = 245 ≤ 300`，
+于是尾块跨隙与 b 合并为一次回源，额外拉取 5 字节：
+
+```bash
+curl -X POST http://localhost:3000/shared-fetch-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"size":1000,"clients":[{"id":"a","ranges":[{"start":0,"end":449}]},{"id":"b","ranges":[{"start":455,"end":544}]}],"maxFetchBytes":300,"maxGapBytes":10}'
+```
+
+响应：
+
+```json
+{
+  "statusCode": 200,
+  "resource": { "size": 1000 },
+  "limits": { "maxFetchBytes": 300, "maxGapBytes": 10 },
+  "clientsCount": 2,
+  "fetchesCount": 2,
+  "fetches": [
+    { "index": 1, "start": 0, "end": 299, "bytes": 300,
+      "rangeHeader": "bytes=0-299", "demandBytes": 300, "extraBytes": 0 },
+    { "index": 2, "start": 300, "end": 544, "bytes": 245,
+      "rangeHeader": "bytes=300-544", "demandBytes": 240, "extraBytes": 5 }
+  ],
+  "clients": [
+    { "id": "a", "requestedBytes": 450, "servedBytes": 450, "missingBytes": 0,
+      "coverage": [
+        { "fetchIndex": 1, "ranges": [{ "start": 0, "end": 299 }], "bytes": 300 },
+        { "fetchIndex": 2, "ranges": [{ "start": 300, "end": 449 }], "bytes": 150 }
+      ] },
+    { "id": "b", "requestedBytes": 90, "servedBytes": 90, "missingBytes": 0,
+      "coverage": [
+        { "fetchIndex": 2, "ranges": [{ "start": 455, "end": 544 }], "bytes": 90 }
+      ] }
+  ],
+  "bytes": { "demand": 540, "fetched": 545, "extra": 5, "resource": 1000 }
+}
+```
+
+参数错误示例（同一 `id` 出现两次 → 400）：
+
+```bash
+curl -i -X POST http://localhost:3000/shared-fetch-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"size":100,"clients":[{"id":"a","ranges":[]},{"id":"a","ranges":[]}],"maxFetchBytes":10,"maxGapBytes":0}'
+# HTTP/1.1 400 Bad Request
+# {"statusCode":400,"code":"DUPLICATE_CLIENT_ID",...}
+```
+
 服务默认监听本机 **3000 端口**（`http://localhost:3000`），用
 `docker compose up --build -d` 一条命令即可启动（见上文"单条启动命令"）。
 
@@ -687,7 +791,8 @@ src/
   assemble.js       # 稀疏缓存拼装：片段校验、重叠冲突检测、覆盖核算、单段/multipart 报文生成
   cache-integrity.js # 稀疏缓存完整性校验：片段合并、逐块 SHA-256 比对、verified/missing/corrupt 分类、重取区间合并
   cache-retention.js # 缓存保留规划：缓存归并、访问权重扫描线累加、按权重/偏移选满预算、截断与归并
-  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、/healthz、输入校验
+  shared-fetch.js   # 共享回源规划：跨客户端需求归并、按上限拆块、带间隙阈值的自左向右跨隙合并、逐客户端覆盖核算
+  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、/healthz、输入校验
   server.js         # 启动入口与环境变量读取
 test/
   planner.test.js       # 原有 node:test 用例（26 个）
@@ -698,13 +803,14 @@ test/
   assemble.test.js      # 稀疏缓存拼装用例（31 个）
   cache-integrity.test.js # 稀疏缓存完整性校验用例（30 个）
   cache-retention.test.js # 缓存保留规划用例（29 个）
+  shared-fetch.test.js  # 共享回源规划用例（33 个）
 ```
 
 ## 本地开发与测试
 
 ```bash
 npm ci
-npm test          # 210 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划
+npm test          # 243 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划 + 共享回源规划
 npm start
 ```
 
@@ -750,3 +856,11 @@ npm start
   `cached` 与 `accesses` 各上限 1000 项、访问权重上限 100 万，多余字段一律
   `400`；区间必须满足 `0 ≤ start ≤ end < size`；单字节累计权重最高
   10^9（1000 × 10^6），权重累加与字节核算全程在安全整数范围内，不会溢出。
+- `/shared-fetch-plan` 同样使用严格校验器：字符串数字、小数、多余字段一律
+  `400`；`clients` 上限 1000 个、每个客户端的 `ranges` 上限 10000 项；
+  客户端 `id` 必须是非空字符串（不超过 255 字节、不含 CR/LF，杜绝头注入），
+  同一请求内重复 `id` 返回 `400 DUPLICATE_CLIENT_ID`；区间必须满足
+  `0 ≤ start ≤ end < size`（倒置 `INVALID_CLIENT_RANGE`、越界
+  `CLIENT_RANGE_OUT_OF_BOUNDS`）；`maxFetchBytes` 为正安全整数、
+  `maxGapBytes` 为非负安全整数。回源区间的拆分、跨隙合并与字节核算全程
+  只做安全整数加减，不会溢出。
